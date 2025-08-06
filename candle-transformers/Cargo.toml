@@ -25,6 +25,7 @@ serde_json = { workspace = true }
 serde_plain = { workspace = true }
 tracing = { workspace = true }
 candle-cublaslt = { path = "../../candle-extensions/candle-cublaslt" }
+cudarc = { workspace = true }
 
 [features]
 default = []

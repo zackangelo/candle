@@ -402,42 +402,6 @@ fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> Result<Tensor>
 }
 
 #[derive(Debug, Clone)]
-struct Mlp {
-    c_fc1: LlamaLinear,
-    c_fc2: LlamaLinear,
-    c_proj: LlamaLinear,
-    span: tracing::Span,
-}
-
-impl Mlp {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let _enter = self.span.enter();
-        let x = (candle_nn::ops::silu(&self.c_fc1.forward(x)?)? * self.c_fc2.forward(x)?)?;
-        self.c_proj.forward(&x)
-    }
-
-    fn load(cublas_lt: CublasLt, vb: VarBuilder, cfg: &Config) -> Result<Self> {
-        let span = tracing::span!(tracing::Level::TRACE, "mlp");
-        let h_size = cfg.hidden_size;
-        let i_size = cfg.intermediate_size;
-        let c_fc1 = cublas_linear(cublas_lt.clone(), h_size, i_size, vb.pp("gate_proj"))?;
-        let c_fc2 = cublas_linear(cublas_lt.clone(), h_size, i_size, vb.pp("up_proj"))?;
-        let c_proj = cublas_linear(cublas_lt.clone(), i_size, h_size, vb.pp("down_proj"))?;
-
-        // let c_fc1 = linear(h_size, i_size, vb.pp("gate_proj"))?;
-        // let c_fc2 = linear(h_size, i_size, vb.pp("up_proj"))?;
-        // let c_proj = linear(i_size, h_size, vb.pp("down_proj"))?;
-
-        Ok(Self {
-            c_fc1,
-            c_fc2,
-            c_proj,
-            span,
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
 struct Block {
     rms_1: RmsNorm,
     attn: CausalSelfAttention,
@@ -569,8 +533,7 @@ impl candle::Module for CublasLtLinear {
         let dims = x.dims();
         let w_in = *self.weight.dims().last().unwrap();
         // let x = x.t()?;
-
-        let in_dims = x.dims();
+        // let in_dims = x.dims();
 
         match *dims {
             // ----------------------------------------------------------------
@@ -614,18 +577,10 @@ impl candle::Module for CublasLtLinear {
 
                 let y = y.t()?.reshape((b, s, out_dim))?;
 
-                // let out_dims = y.dims();
-                // println!("in_dims: {:?}, out_dims: {:?}", in_dims, out_dims);
-
                 Ok(y)
             }
 
-            _ => candle::bail!(
-                "CudaLinear expects (m, {}) or (b, s, {}), got {:?}",
-                w_in,
-                w_in,
-                dims
-            ),
+            _ => candle::bail!("cublas lt linear expects (b, s, h), got {:?}", dims),
         }
     }
 }
@@ -661,4 +616,81 @@ pub fn cublas_linear(
         bias,
         cublas_lt,
     }))
+}
+
+#[derive(Debug, Clone)]
+struct Mlp {
+    gate_proj: LlamaLinear,
+    up_proj: LlamaLinear,
+    down_proj: LlamaLinear,
+    span: tracing::Span,
+}
+
+impl Mlp {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let x = (candle_nn::ops::silu(&self.gate_proj.forward(x)?)? * self.up_proj.forward(x)?)?;
+        self.down_proj.forward(&x)
+    }
+
+    fn load(cublas_lt: CublasLt, vb: VarBuilder, cfg: &Config) -> Result<Self> {
+        let span = tracing::span!(tracing::Level::TRACE, "mlp");
+        let h_size = cfg.hidden_size;
+        let i_size = cfg.intermediate_size;
+        let gate_proj = cublas_linear(cublas_lt.clone(), h_size, i_size, vb.pp("gate_proj"))?;
+        let up_proj = cublas_linear(cublas_lt.clone(), h_size, i_size, vb.pp("up_proj"))?;
+        let down_proj = cublas_linear(cublas_lt.clone(), i_size, h_size, vb.pp("down_proj"))?;
+
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+            span,
+        })
+    }
+}
+
+pub struct LlamaMlp {
+    gate_proj: LlamaLinear,
+    up_proj: LlamaLinear,
+    down_proj: LlamaLinear,
+    span: tracing::Span,
+}
+
+impl LlamaMlp {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let _enter = self.span.enter();
+
+        // SiLU(gate)
+        let gate = self.gate_proj.forward(x)?.silu()?;
+
+        // linear(up)
+        let up = self.up_proj.forward(x)?;
+
+        // element-wise product
+        let hidden = (&gate * &up)?;
+
+        // final linear
+        let y = self.down_proj.forward(&hidden)?;
+
+        Ok(y)
+    }
+
+    fn load(cublas_lt: CublasLt, vb: VarBuilder, cfg: &Config) -> Result<Self> {
+        let span = tracing::span!(tracing::Level::TRACE, "mlp");
+
+        let h_size = cfg.hidden_size;
+        let i_size = cfg.intermediate_size;
+
+        let gate_proj = cublas_linear(cublas_lt.clone(), h_size, i_size, vb.pp("gate_proj"))?;
+        let up_proj = cublas_linear(cublas_lt.clone(), h_size, i_size, vb.pp("up_proj"))?;
+        let down_proj = cublas_linear(cublas_lt.clone(), i_size, h_size, vb.pp("down_proj"))?;
+
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+            span,
+        })
+    }
 }
