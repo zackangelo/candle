@@ -161,7 +161,7 @@ macro_rules! ops{
 pub mod unary {
     ops!(
         cos, sin, exp, sqr, sqrt, neg, log, gelu, abs, ceil, floor, relu, round, erf, gelu_erf,
-        tanh, recip, silu, sign, sigmoid
+        tanh, recip, silu, sign, sigmoid, const_set
     );
 }
 pub mod binary {
@@ -416,6 +416,82 @@ pub fn call_copy2d(
     encoder.use_resource(input, metal::MTLResourceUsage::Read);
     encoder.use_resource(output, metal::MTLResourceUsage::Write);
     encoder.dispatch_threads(grid_dims, group_dims);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_const_set_contiguous_tiled(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    kernel_name: unary::contiguous_tiled::Kernel,
+    length: usize,
+    input: impl EncoderParam,
+    output: BufferOffset,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Unary, kernel_name.0)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    let tile_size = 2;
+    let tiles = length.div_ceil(tile_size);
+
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(encoder, (length, input, &output));
+
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, tiles);
+    encoder.use_resource(output.buffer, metal::MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_const_set_contiguous(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    kernel_name: unary::contiguous::Kernel,
+    length: usize,
+    input: impl EncoderParam,
+    output: BufferOffset,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Unary, kernel_name.0)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(encoder, (length, input, &output));
+
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, length);
+    encoder.use_resource(output.buffer, metal::MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_const_set_strided(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: unary::strided::Kernel,
+    shape: &[usize],
+    input: impl EncoderParam,
+    strides: &[usize],
+    output: BufferOffset,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Unary, name.0)?;
+
+    let length: usize = shape.iter().product();
+    let num_dims: usize = shape.len();
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, length);
+
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(encoder, (length, num_dims, shape, strides, input, &output));
+    encoder.use_resource(output.buffer, metal::MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
 
@@ -915,6 +991,7 @@ pub fn call_rope_i(
     kernel_name: &'static str,
     bh: usize,
     td: usize,
+    stride_b: usize,
     src: &Buffer,
     src_offset: usize,
     cos: &Buffer,
@@ -933,6 +1010,7 @@ pub fn call_rope_i(
         (
             bh,
             td,
+            stride_b,
             (src, src_offset),
             (cos, cos_offset),
             (sin, sin_offset),
@@ -958,6 +1036,7 @@ pub fn call_rope_thd(
     t: usize,
     h: usize,
     d: usize,
+    stride_b: usize,
     src: &Buffer,
     src_offset: usize,
     cos: &Buffer,
@@ -978,6 +1057,7 @@ pub fn call_rope_thd(
             t,
             h,
             d,
+            stride_b,
             (src, src_offset),
             (cos, cos_offset),
             (sin, sin_offset),
@@ -1002,6 +1082,7 @@ pub fn call_rope(
     bh: usize,
     td: usize,
     d: usize,
+    stride_b: usize,
     src: &Buffer,
     src_offset: usize,
     cos: &Buffer,
@@ -1021,6 +1102,7 @@ pub fn call_rope(
             bh,
             td,
             d,
+            stride_b,
             (src, src_offset),
             (cos, cos_offset),
             (sin, sin_offset),
@@ -1371,7 +1453,7 @@ pub fn call_gather(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn call_scatter_add(
+pub fn call_scatter(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1381,7 +1463,7 @@ pub fn call_scatter_add(
     dim: usize,
     input: BufferOffset,
     ids: BufferOffset,
-    output: &Buffer,
+    output: BufferOffset,
 ) -> Result<(), MetalKernelError> {
     let left_size: usize = src_shape[..dim].iter().product();
     let right_size: usize = src_shape[dim + 1..].iter().product();
@@ -1406,7 +1488,7 @@ pub fn call_scatter_add(
             dst_dim_size,
             &input,
             &ids,
-            output
+            &output
         )
     );
 
@@ -1414,7 +1496,7 @@ pub fn call_scatter_add(
 
     encoder.use_resource(input.buffer, metal::MTLResourceUsage::Read);
     encoder.use_resource(ids.buffer, metal::MTLResourceUsage::Read);
-    encoder.use_resource(output, metal::MTLResourceUsage::Write);
+    encoder.use_resource(output.buffer, metal::MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -2259,6 +2341,7 @@ pub enum GgmlDType {
     Q8K,
     F16,
     F32,
+    BF16,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2336,7 +2419,7 @@ pub fn call_quantized_matmul_mv_t(
             let align = 2;
             (nth0, nth1, align)
         }
-        GgmlDType::F16 | GgmlDType::Q8K => {
+        GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::Q8K => {
             // Original implem uses rows
             let nth0 = 32;
             let nth1 = 1;
@@ -2374,6 +2457,7 @@ pub fn call_quantized_matmul_mv_t(
         GgmlDType::Q6K => "kernel_mul_mv_q6_K_f32",
         GgmlDType::Q8K => "kernel_mul_mv_q8_K_f32",
         GgmlDType::F16 => "kernel_mul_mv_f16_f32",
+        GgmlDType::BF16 => "kernel_mul_mv_bf16_f32",
         GgmlDType::F32 => "kernel_mul_mv_f32_f32",
     };
 
@@ -2409,6 +2493,114 @@ pub fn call_quantized_matmul_mv_t(
     encoder.use_resource(lhs, metal::MTLResourceUsage::Read);
     encoder.use_resource(rhs, metal::MTLResourceUsage::Read);
     encoder.use_resource(dst, metal::MTLResourceUsage::Write);
+
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
+/// - src0 is usually weight
+/// - src1 is usually xs
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mm_t(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GgmlDType,
+    src0_shape: &[usize],
+    src0_stride: &[usize],
+    src0: &Buffer,
+    src1_shape: &[usize],
+    src1_stride: &[usize],
+    src1: &Buffer,
+    src1_offset: usize,
+    dst_shape: &[usize],
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    // Everything is in reverse
+    let ne00 = src0_shape[src0_shape.len() - 1] as i64;
+    let ne01 = src0_shape[src0_shape.len() - 2] as i64;
+    let ne02 = src0_shape[src0_shape.len() - 3] as i64;
+    let ne03 = src0_shape[src0_shape.len() - 4] as i64;
+
+    let nb01 = src0_stride[src0_stride.len() - 2] as i64;
+    let nb02 = src0_stride[src0_stride.len() - 3] as i64;
+    let nb03 = src0_stride[src0_stride.len() - 4] as i64;
+
+    let ne11 = src1_shape[src1_shape.len() - 2] as i64;
+    let ne12 = src1_shape[src1_shape.len() - 3] as i64;
+    let ne13 = src1_shape[src1_shape.len() - 4] as i64;
+
+    let nb10 = src1_stride[src1_stride.len() - 1] as i64;
+    let nb11 = src1_stride[src1_stride.len() - 2] as i64;
+    let nb12 = src1_stride[src1_stride.len() - 3] as i64;
+    let nb13 = src1_stride[src1_stride.len() - 4] as i64;
+
+    let ne0 = dst_shape[dst_shape.len() - 1] as i64;
+    let ne1 = dst_shape[dst_shape.len() - 2] as i64;
+    let r2 = (ne12 / ne02) as u32;
+    let r3 = (ne13 / ne03) as u32;
+
+    let thread_groups_count = MTLSize {
+        width: divide(ne11 as usize, 32),
+        height: divide(ne01 as usize, 64),
+        depth: (ne12 * ne13) as u64,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: 128,
+        height: 1,
+        depth: 1,
+    };
+    let name = match dtype {
+        GgmlDType::Q4_0 => "kernel_mul_mm_q4_0_f32",
+        GgmlDType::Q4_1 => "kernel_mul_mm_q4_1_f32",
+        GgmlDType::Q5_0 => "kernel_mul_mm_q5_0_f32",
+        GgmlDType::Q5_1 => "kernel_mul_mm_q5_1_f32",
+        GgmlDType::Q8_0 => "kernel_mul_mm_q8_0_f32",
+        GgmlDType::Q8_1 => "kernel_mul_mm_q8_1_f32",
+        GgmlDType::Q2K => "kernel_mul_mm_q2_K_f32",
+        GgmlDType::Q3K => "kernel_mul_mm_q3_K_f32",
+        GgmlDType::Q4K => "kernel_mul_mm_q4_K_f32",
+        GgmlDType::Q5K => "kernel_mul_mm_q5_K_f32",
+        GgmlDType::Q6K => "kernel_mul_mm_q6_K_f32",
+        GgmlDType::Q8K => "kernel_mul_mm_q8_K_f32",
+        GgmlDType::F16 => "kernel_mul_mm_f16_f32",
+        GgmlDType::BF16 => "kernel_mul_mm_bf16_f32",
+        GgmlDType::F32 => "kernel_mul_mm_f32_f32",
+    };
+
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(
+        encoder,
+        (
+            src0,
+            (src1, src1_offset),
+            (dst, dst_offset),
+            ne00,
+            ne02,
+            nb01,
+            nb02,
+            nb03,
+            ne12,
+            nb10,
+            nb11,
+            nb12,
+            nb13,
+            ne0,
+            ne1,
+            r2,
+            r3
+        )
+    );
+    encoder.use_resource(src0, metal::MTLResourceUsage::Read);
+    encoder.use_resource(src1, metal::MTLResourceUsage::Read);
+    encoder.use_resource(dst, metal::MTLResourceUsage::Write);
+
+    encoder.set_threadgroup_memory_length(0, 8192);
 
     encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
     Ok(())
@@ -2570,7 +2762,7 @@ pub fn call_const_fill(
     name: &'static str,
     length: usize,
     output: &Buffer,
-    v: f32,
+    v: impl EncoderParam,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Fill, name)?;
     let encoder = ep.encoder();

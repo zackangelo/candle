@@ -1,5 +1,6 @@
 pub(crate) mod affine;
 pub(crate) mod conv_transpose2d;
+pub(crate) mod copy;
 pub(crate) mod matmul;
 pub(crate) mod qmatmul;
 pub(crate) mod random;
@@ -21,7 +22,10 @@ impl BenchDevice for Device {
             Device::Cpu => Ok(()),
             Device::Cuda(device) => {
                 #[cfg(feature = "cuda")]
-                return Ok(device.synchronize()?);
+                {
+                    use cuda::WrapErr;
+                    return Ok(device.synchronize().w()?);
+                }
                 #[cfg(not(feature = "cuda"))]
                 panic!("Cuda device without cuda feature enabled: {:?}", device)
             }
