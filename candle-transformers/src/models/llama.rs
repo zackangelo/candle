@@ -4,10 +4,11 @@
 //!
 //! Implementation based on Hugging Face's [transformers](https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py)
 
-use super::with_tracing::{linear_no_bias as linear, Linear, RmsNorm};
+use super::with_tracing::{Linear, RmsNorm};
 use candle::{DType, Device, IndexOp, Result, Tensor, D};
+use candle_cublaslt::{CublasLTMatmul, CublasLt};
 use candle_nn::{embedding, Embedding, Module, VarBuilder};
-use std::{collections::HashMap, f32::consts::PI};
+use std::{collections::HashMap, f32::consts::PI, sync::Arc};
 
 pub const DEFAULT_MAX_SEQ_LEN: usize = 4096;
 
@@ -231,10 +232,10 @@ impl Cache {
 
 #[derive(Debug, Clone)]
 struct CausalSelfAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: LlamaLinear,
+    k_proj: LlamaLinear,
+    v_proj: LlamaLinear,
+    o_proj: LlamaLinear,
     num_attention_heads: usize,
     num_key_value_heads: usize,
     head_dim: usize,
@@ -361,16 +362,22 @@ impl CausalSelfAttention {
         crate::utils::repeat_kv(x, self.num_attention_heads / self.num_key_value_heads)
     }
 
-    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    fn load(cublas_lt: CublasLt, vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "attn");
         let span_rot = tracing::span!(tracing::Level::TRACE, "attn-rot");
         let size_in = cfg.hidden_size;
         let size_q = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_attention_heads;
         let size_kv = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_key_value_heads;
-        let q_proj = linear(size_in, size_q, vb.pp("q_proj"))?;
-        let k_proj = linear(size_in, size_kv, vb.pp("k_proj"))?;
-        let v_proj = linear(size_in, size_kv, vb.pp("v_proj"))?;
-        let o_proj = linear(size_q, size_in, vb.pp("o_proj"))?;
+        // let q_proj = linear(size_in, size_q, vb.pp("q_proj"))?;
+        // let k_proj = linear(size_in, size_kv, vb.pp("k_proj"))?;
+        // let v_proj = linear(size_in, size_kv, vb.pp("v_proj"))?;
+        // let o_proj = linear(size_q, size_in, vb.pp("o_proj"))?;
+
+        let q_proj = cublas_linear(cublas_lt.clone(), size_in, size_q, vb.pp("q_proj"))?;
+        let k_proj = cublas_linear(cublas_lt.clone(), size_in, size_kv, vb.pp("k_proj"))?;
+        let v_proj = cublas_linear(cublas_lt.clone(), size_in, size_kv, vb.pp("v_proj"))?;
+        let o_proj = cublas_linear(cublas_lt.clone(), size_q, size_in, vb.pp("o_proj"))?;
+
         Ok(Self {
             q_proj,
             k_proj,
@@ -396,9 +403,9 @@ fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> Result<Tensor>
 
 #[derive(Debug, Clone)]
 struct Mlp {
-    c_fc1: Linear,
-    c_fc2: Linear,
-    c_proj: Linear,
+    c_fc1: LlamaLinear,
+    c_fc2: LlamaLinear,
+    c_proj: LlamaLinear,
     span: tracing::Span,
 }
 
@@ -409,13 +416,18 @@ impl Mlp {
         self.c_proj.forward(&x)
     }
 
-    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    fn load(cublas_lt: CublasLt, vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "mlp");
         let h_size = cfg.hidden_size;
         let i_size = cfg.intermediate_size;
-        let c_fc1 = linear(h_size, i_size, vb.pp("gate_proj"))?;
-        let c_fc2 = linear(h_size, i_size, vb.pp("up_proj"))?;
-        let c_proj = linear(i_size, h_size, vb.pp("down_proj"))?;
+        let c_fc1 = cublas_linear(cublas_lt.clone(), h_size, i_size, vb.pp("gate_proj"))?;
+        let c_fc2 = cublas_linear(cublas_lt.clone(), h_size, i_size, vb.pp("up_proj"))?;
+        let c_proj = cublas_linear(cublas_lt.clone(), i_size, h_size, vb.pp("down_proj"))?;
+
+        // let c_fc1 = linear(h_size, i_size, vb.pp("gate_proj"))?;
+        // let c_fc2 = linear(h_size, i_size, vb.pp("up_proj"))?;
+        // let c_proj = linear(i_size, h_size, vb.pp("down_proj"))?;
+
         Ok(Self {
             c_fc1,
             c_fc2,
@@ -451,10 +463,10 @@ impl Block {
         Ok(x)
     }
 
-    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    fn load(cublas_lt: CublasLt, vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "block");
-        let attn = CausalSelfAttention::load(vb.pp("self_attn"), cfg)?;
-        let mlp = Mlp::load(vb.pp("mlp"), cfg)?;
+        let attn = CausalSelfAttention::load(cublas_lt.clone(), vb.pp("self_attn"), cfg)?;
+        let mlp = Mlp::load(cublas_lt.clone(), vb.pp("mlp"), cfg)?;
         let rms_1 = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let rms_2 = RmsNorm::new(
             cfg.hidden_size,
@@ -515,15 +527,18 @@ impl Llama {
     }
 
     pub fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+        let cublas_lt = CublasLt::new(vb.device())?;
         let wte = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
         let lm_head = if cfg.tie_word_embeddings {
             Linear::from_weights(wte.embeddings().clone(), None)
         } else {
-            linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
+            super::with_tracing::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
         let ln_f = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
         let blocks: Vec<_> = (0..cfg.num_hidden_layers)
-            .map(|i| Block::load(vb.pp(format!("model.layers.{i}")), cfg).unwrap())
+            .map(|i| {
+                Block::load(cublas_lt.clone(), vb.pp(format!("model.layers.{i}")), cfg).unwrap()
+            })
             .collect();
 
         Ok(Self {
@@ -533,4 +548,117 @@ impl Llama {
             lm_head,
         })
     }
+}
+
+#[derive(Debug, Clone)]
+pub enum LlamaLinear {
+    CublasLt(CublasLtLinear),
+    Candle(super::with_tracing::Linear),
+}
+
+#[derive(Debug, Clone)]
+pub struct CublasLtLinear {
+    pub prefix: String,
+    pub weight: Tensor,
+    pub bias: Option<Tensor>,
+    pub cublas_lt: CublasLt,
+}
+
+impl candle::Module for CublasLtLinear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let dims = x.dims();
+        let w_in = *self.weight.dims().last().unwrap();
+        // let x = x.t()?;
+
+        let in_dims = x.dims();
+
+        match *dims {
+            // ----------------------------------------------------------------
+            // 2-D  input: (m, in_dim)
+            // ----------------------------------------------------------------
+            // [m, k] if k == w_in => {
+            //     let out_dim = self.weight.dims()[0];
+
+            //     let y = candle_cublaslt::fused_matmul(
+            //         x,
+            //         &self.weight,
+            //         None,
+            //         None,
+            //         None,
+            //         self.bias.as_ref(),
+            //         None,
+            //         self.cublas_lt.clone(),
+            //     )?;
+
+            //     Ok(y)
+            // }
+
+            // ----------------------------------------------------------------
+            // 3-D  input: (batch, seq, in_dim)
+            // ----------------------------------------------------------------
+            [b, s, k] if k == w_in => {
+                let m = b * s;
+                let x = x.reshape((m, k))?;
+                let out_dim = self.weight.dims()[0];
+
+                let y = candle_cublaslt::fused_matmul(
+                    &x,
+                    &self.weight,
+                    None,
+                    None,
+                    None,
+                    self.bias.as_ref(),
+                    None,
+                    self.cublas_lt.clone(),
+                )?;
+
+                let y = y.t()?.reshape((b, s, out_dim))?;
+
+                // let out_dims = y.dims();
+                // println!("in_dims: {:?}, out_dims: {:?}", in_dims, out_dims);
+
+                Ok(y)
+            }
+
+            _ => candle::bail!(
+                "CudaLinear expects (m, {}) or (b, s, {}), got {:?}",
+                w_in,
+                w_in,
+                dims
+            ),
+        }
+    }
+}
+
+impl candle::Module for LlamaLinear {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            LlamaLinear::CublasLt(ln) => ln.forward(xs),
+            LlamaLinear::Candle(ln) => ln.forward(xs),
+        }
+    }
+}
+
+pub fn linear(d1: usize, d2: usize, vb: VarBuilder) -> Result<LlamaLinear> {
+    let ln = super::with_tracing::linear_no_bias(d1, d2, vb)?;
+    Ok(LlamaLinear::Candle(ln))
+}
+
+pub fn cublas_linear(
+    cublas_lt: CublasLt,
+    d1: usize,
+    d2: usize,
+    vb: VarBuilder,
+) -> Result<LlamaLinear> {
+    let prefix = vb.prefix();
+    let init_ws = candle_nn::init::DEFAULT_KAIMING_NORMAL;
+    let weight = vb.get_with_hints((d2, d1), "weight", init_ws)?;
+    let bias = None;
+
+    Ok(LlamaLinear::CublasLt(CublasLtLinear {
+        prefix,
+        weight,
+        bias,
+        cublas_lt,
+    }))
 }

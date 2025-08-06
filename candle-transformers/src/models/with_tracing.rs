@@ -35,8 +35,8 @@ impl Module for Embedding {
 
 #[derive(Debug, Clone)]
 pub struct Linear {
-    inner: candle_nn::Linear,
-    span: tracing::Span,
+    pub(crate) inner: candle_nn::Linear,
+    pub(crate) span: tracing::Span,
 }
 
 impl Linear {
