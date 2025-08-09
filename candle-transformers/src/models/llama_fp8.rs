@@ -280,9 +280,10 @@ impl CausalSelfAttention {
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b_sz, seq_len, hidden_size) = x.dims3()?;
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let (x_scale, x) = quantize_fp8_scalar_gpu(x)?;
+        let q = self.q_proj.forward_fp8(&x, &x_scale)?;
+        let k = self.k_proj.forward_fp8(&x, &x_scale)?;
+        let v = self.v_proj.forward_fp8(&x, &x_scale)?;
 
         let q = q
             .reshape((b_sz, seq_len, self.num_attention_heads, self.head_dim))?
@@ -525,6 +526,15 @@ pub enum LlamaLinear {
     Candle(super::with_tracing::Linear),
 }
 
+impl LlamaLinear {
+    fn forward_fp8(&self, xs: &Tensor, scale: &Tensor) -> Result<Tensor> {
+        match self {
+            LlamaLinear::CublasLt(ln) => ln.forward_fp8(xs, scale),
+            LlamaLinear::Candle(ln) => candle::bail!("candle linear does not support fp8"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CublasLtLinearFp8 {
     pub prefix: String,
@@ -534,12 +544,14 @@ pub struct CublasLtLinearFp8 {
     pub cublas_lt: CublasLt,
 }
 
-impl candle::Module for CublasLtLinearFp8 {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+impl CublasLtLinearFp8 {
+    fn forward_fp8(&self, x: &Tensor, scale: &Tensor) -> Result<Tensor> {
+        if x.dtype() != DType::F8E4M3 {
+            candle::bail!("input tensor must be fp8, got {:?}", x.dtype());
+        }
+
         let dims = x.dims();
         let w_in = *self.weight.dims().last().unwrap();
-        // let x = x.t()?;
-        // let in_dims = x.dims();
 
         match *dims {
             // ----------------------------------------------------------------
@@ -568,18 +580,13 @@ impl candle::Module for CublasLtLinearFp8 {
             [b, s, k] if k == w_in => {
                 let m = b * s;
                 let x = x.reshape((m, k))?;
-                let (a_scale, a_fp8) = quantize_fp8_scalar(&x)?;
+
                 let out_dim = self.weight.dims()[0];
-                let b_scale = self
-                    .weight_scale
-                    .to_dtype(DType::F32)?
-                    .reshape(())?
-                    .to_vec0::<f32>()?; //TODO leave on cuda device
                 let y = candle_cublaslt::fp8_scalar_fused_matmul(
-                    &a_fp8,
-                    a_scale,
+                    &x,
+                    &scale,
                     &self.weight,
-                    b_scale,
+                    &self.weight_scale,
                     None,
                     DType::F16,
                     None,
@@ -599,6 +606,14 @@ impl candle::Module for CublasLtLinearFp8 {
     }
 }
 
+impl candle::Module for CublasLtLinearFp8 {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let (x_scale, x_fp8) = quantize_fp8_scalar_gpu(&xs)?;
+        let y = self.forward_fp8(&x_fp8, &x_scale)?;
+        Ok(y)
+    }
+}
+
 impl candle::Module for LlamaLinear {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
@@ -611,22 +626,6 @@ impl candle::Module for LlamaLinear {
 pub fn linear(d1: usize, d2: usize, vb: VarBuilder) -> Result<LlamaLinear> {
     let ln = super::with_tracing::linear_no_bias(d1, d2, vb)?;
     Ok(LlamaLinear::Candle(ln))
-}
-
-fn quantize_fp8_scalar(x: &Tensor) -> Result<(f32, Tensor)> {
-    let max_abs = x.abs()?.max_all()?.to_dtype(DType::F32)?.to_vec0::<f32>()?;
-    let eps = 1e-6f32;
-
-    let scale = if max_abs > eps {
-        max_abs / (float8::F8E4M3::MAX.to_f32() - eps)
-    } else {
-        1.0f32
-    };
-
-    let scale_b = Tensor::from_vec(vec![scale], (), x.device())?.to_dtype(x.dtype())?;
-    let y = x.broadcast_div(&scale_b)?.to_dtype(DType::F8E4M3)?;
-
-    Ok((scale, y))
 }
 
 fn quantize_fp8_scalar_gpu(x: &Tensor) -> Result<(Tensor /*scale_f32*/, Tensor /*x_fp8*/)> {
@@ -677,7 +676,12 @@ struct Mlp {
 impl Mlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let x = (candle_nn::ops::silu(&self.gate_proj.forward(x)?)? * self.up_proj.forward(x)?)?;
+
+        let (x_scale, x_fp8) = quantize_fp8_scalar_gpu(x)?;
+
+        let x = (candle_nn::ops::silu(&self.gate_proj.forward_fp8(&x_fp8, &x_scale)?)?
+            * self.up_proj.forward_fp8(&x_fp8, &x_scale)?)?;
+
         self.down_proj.forward(&x)
     }
 
@@ -697,48 +701,3 @@ impl Mlp {
         })
     }
 }
-
-// pub struct LlamaMlp {
-//     gate_proj: LlamaLinear,
-//     up_proj: LlamaLinear,
-//     down_proj: LlamaLinear,
-//     span: tracing::Span,
-// }
-
-// impl LlamaMlp {
-//     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-//         let _enter = self.span.enter();
-
-//         // SiLU(gate)
-//         let gate = self.gate_proj.forward(x)?.silu()?;
-
-//         // linear(up)
-//         let up = self.up_proj.forward(x)?;
-
-//         // element-wise product
-//         let hidden = (&gate * &up)?;
-
-//         // final linear
-//         let y = self.down_proj.forward(&hidden)?;
-
-//         Ok(y)
-//     }
-
-//     fn load(cublas_lt: CublasLt, vb: VarBuilder, cfg: &Config) -> Result<Self> {
-//         let span = tracing::span!(tracing::Level::TRACE, "mlp");
-
-//         let h_size = cfg.hidden_size;
-//         let i_size = cfg.intermediate_size;
-
-//         let gate_proj = cublas_linear(cublas_lt.clone(), h_size, i_size, vb.pp("gate_proj"))?;
-//         let up_proj = cublas_linear(cublas_lt.clone(), h_size, i_size, vb.pp("up_proj"))?;
-//         let down_proj = cublas_linear(cublas_lt.clone(), i_size, h_size, vb.pp("down_proj"))?;
-
-//         Ok(Self {
-//             gate_proj,
-//             up_proj,
-//             down_proj,
-//             span,
-//         })
-//     }
-// }
