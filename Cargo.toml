@@ -43,7 +43,7 @@ candle-onnx = { path = "./candle-onnx", version = "0.9.1" }
 candle-transformers = { path = "./candle-transformers", version = "0.9.1" }
 clap = { version = "4.2.4", features = ["derive"] }
 criterion = { version = "0.5.1", default-features = false }
-cudarc = { path = "../cudarc", features = [
+cudarc = { git = "https://github.com/mixlayer/cudarc.git", branch = "cublaslt_fp8", features = [
     "std",
     "cublas",
     "cublaslt",
