@@ -8,7 +8,7 @@ use super::with_tracing::{Linear, RmsNorm};
 use candle::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_cublaslt::CublasLt;
 use candle_nn::{embedding, Embedding, Module, VarBuilder};
-use std::{collections::HashMap, f32::consts::PI};
+use std::{collections::HashMap, f32::consts::PI, sync::Arc};
 
 pub const DEFAULT_MAX_SEQ_LEN: usize = 4096;
 
@@ -244,6 +244,7 @@ struct CausalSelfAttention {
     span: tracing::Span,
     span_rot: tracing::Span,
     max_position_embeddings: usize,
+    quant: Arc<Fp8Quantize>,
 }
 
 #[cfg(feature = "flash-attn")]
@@ -280,7 +281,7 @@ impl CausalSelfAttention {
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b_sz, seq_len, hidden_size) = x.dims3()?;
-        let (x_scale, x) = quantize_fp8_scalar_gpu(x)?;
+        let (x_scale, x) = self.quant.apply(x)?;
         let q = self.q_proj.forward_fp8(&x, &x_scale)?;
         let k = self.k_proj.forward_fp8(&x, &x_scale)?;
         let v = self.v_proj.forward_fp8(&x, &x_scale)?;
@@ -364,21 +365,46 @@ impl CausalSelfAttention {
         crate::utils::repeat_kv(x, self.num_attention_heads / self.num_key_value_heads)
     }
 
-    fn load(cublas_lt: CublasLt, vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    fn load(
+        cublas_lt: CublasLt,
+        quant: Arc<Fp8Quantize>,
+        vb: VarBuilder,
+        cfg: &Config,
+    ) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "attn");
         let span_rot = tracing::span!(tracing::Level::TRACE, "attn-rot");
         let size_in = cfg.hidden_size;
         let size_q = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_attention_heads;
         let size_kv = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_key_value_heads;
-        // let q_proj = linear(size_in, size_q, vb.pp("q_proj"))?;
-        // let k_proj = linear(size_in, size_kv, vb.pp("k_proj"))?;
-        // let v_proj = linear(size_in, size_kv, vb.pp("v_proj"))?;
-        // let o_proj = linear(size_q, size_in, vb.pp("o_proj"))?;
 
-        let q_proj = cublas_linear(cublas_lt.clone(), size_in, size_q, vb.pp("q_proj"))?;
-        let k_proj = cublas_linear(cublas_lt.clone(), size_in, size_kv, vb.pp("k_proj"))?;
-        let v_proj = cublas_linear(cublas_lt.clone(), size_in, size_kv, vb.pp("v_proj"))?;
-        let o_proj = cublas_linear(cublas_lt.clone(), size_q, size_in, vb.pp("o_proj"))?;
+        let q_proj = cublas_linear(
+            cublas_lt.clone(),
+            quant.clone(),
+            size_in,
+            size_q,
+            vb.pp("q_proj"),
+        )?;
+        let k_proj = cublas_linear(
+            cublas_lt.clone(),
+            quant.clone(),
+            size_in,
+            size_kv,
+            vb.pp("k_proj"),
+        )?;
+        let v_proj = cublas_linear(
+            cublas_lt.clone(),
+            quant.clone(),
+            size_in,
+            size_kv,
+            vb.pp("v_proj"),
+        )?;
+        let o_proj = cublas_linear(
+            cublas_lt.clone(),
+            quant.clone(),
+            size_q,
+            size_in,
+            vb.pp("o_proj"),
+        )?;
 
         Ok(Self {
             q_proj,
@@ -392,6 +418,7 @@ impl CausalSelfAttention {
             span,
             span_rot,
             max_position_embeddings: cfg.max_position_embeddings,
+            quant,
         })
     }
 }
@@ -429,10 +456,16 @@ impl Block {
         Ok(x)
     }
 
-    fn load(cublas_lt: CublasLt, vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    fn load(
+        cublas_lt: CublasLt,
+        quant: Arc<Fp8Quantize>,
+        vb: VarBuilder,
+        cfg: &Config,
+    ) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "block");
-        let attn = CausalSelfAttention::load(cublas_lt.clone(), vb.pp("self_attn"), cfg)?;
-        let mlp = Mlp::load(cublas_lt.clone(), vb.pp("mlp"), cfg)?;
+        let attn =
+            CausalSelfAttention::load(cublas_lt.clone(), quant.clone(), vb.pp("self_attn"), cfg)?;
+        let mlp = Mlp::load(cublas_lt.clone(), quant.clone(), vb.pp("mlp"), cfg)?;
         let rms_1 = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let rms_2 = RmsNorm::new(
             cfg.hidden_size,
@@ -494,6 +527,8 @@ impl Llama {
 
     pub fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let cublas_lt = CublasLt::new(vb.device())?;
+        let quant = Arc::new(Fp8Quantize::new(vb.device())?);
+
         let wte = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
         let lm_head = if cfg.tie_word_embeddings {
             Linear::from_weights(wte.embeddings().clone(), None)
@@ -505,6 +540,7 @@ impl Llama {
             .map(|i| {
                 Ok(Block::load(
                     cublas_lt.clone(),
+                    quant.clone(),
                     vb.pp(format!("model.layers.{i}")),
                     cfg,
                 )?)
@@ -542,6 +578,8 @@ pub struct CublasLtLinearFp8 {
     pub weight_scale: Tensor,
     pub bias: Option<Tensor>,
     pub cublas_lt: CublasLt,
+    pub quant: Arc<Fp8Quantize>,
+    pub out_dtype: DType,
 }
 
 impl CublasLtLinearFp8 {
@@ -588,7 +626,7 @@ impl CublasLtLinearFp8 {
                     &self.weight,
                     &self.weight_scale,
                     None,
-                    DType::F16,
+                    self.out_dtype,
                     None,
                     None,
                     self.bias.as_ref(),
@@ -608,7 +646,7 @@ impl CublasLtLinearFp8 {
 
 impl candle::Module for CublasLtLinearFp8 {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let (x_scale, x_fp8) = quantize_fp8_scalar_gpu(&xs)?;
+        let (x_scale, x_fp8) = self.quant.apply(&xs)?;
         let y = self.forward_fp8(&x_fp8, &x_scale)?;
         Ok(y)
     }
@@ -628,23 +666,38 @@ pub fn linear(d1: usize, d2: usize, vb: VarBuilder) -> Result<LlamaLinear> {
     Ok(LlamaLinear::Candle(ln))
 }
 
-fn quantize_fp8_scalar_gpu(x: &Tensor) -> Result<(Tensor /*scale_f32*/, Tensor /*x_fp8*/)> {
-    // 0-D tensor on device
-    let amax = x.abs()?.max_all()?.to_dtype(DType::F32)?; // 1 pass (reduce)
-                                                          // bound = MAX(FP8) - eps as a device scalar
-    let bound = Tensor::from_vec(vec![float8::F8E4M3::MAX.to_f32() - 1e-6], (), x.device())?;
-    let scale = amax.broadcast_div(&bound)?; // scale is 0-D tensor (F32)
-    let inv = scale.recip()?; // prefer multiply
+#[derive(Debug)]
+pub struct Fp8Quantize {
+    bound: Tensor,
+    one: Tensor,
+}
 
-    // Single pass to scale+cast
-    // If Candle lets you cast directly from F16 with multiply in one kernel, use it.
-    let x_scaled = x.to_dtype(DType::F32)?.broadcast_mul(&inv)?;
-    let x_fp8 = x_scaled.to_dtype(DType::F8E4M3)?;
-    Ok((scale, x_fp8))
+impl Fp8Quantize {
+    fn new(device: &Device) -> Result<Self> {
+        let bound = Tensor::from_vec(vec![float8::F8E4M3::MAX.to_f32() - 1e-6f32], (), device)?;
+        let one = Tensor::from_vec(vec![1.0f32], (), device)?;
+        Ok(Self { bound, one })
+    }
+
+    fn apply(&self, x: &Tensor) -> Result<(Tensor /*scale_f32*/, Tensor /*x_fp8*/)> {
+        let amax = x.abs()?.max_all()?.to_dtype(DType::F32)?; // 1 pass (reduce)
+        let scale = amax.broadcast_div(&self.bound)?; // scale is 0-D tensor (F32)
+        let inv = scale.recip()?; // prefer multiply
+
+        // let scale = self.one.clone();
+        // let inv = &self.one.broadcast_div(&self.bound)?;
+
+        // Single pass to scale+cast
+        // If Candle lets you cast directly from F16 with multiply in one kernel, use it.
+        let x_scaled = x.to_dtype(DType::F32)?.broadcast_mul(&inv)?;
+        let x_fp8 = x_scaled.to_dtype(DType::F8E4M3)?;
+        Ok((scale, x_fp8))
+    }
 }
 
 pub fn cublas_linear(
     cublas_lt: CublasLt,
+    quant: Arc<Fp8Quantize>,
     d1: usize,
     d2: usize,
     vb: VarBuilder,
@@ -658,10 +711,12 @@ pub fn cublas_linear(
 
     Ok(LlamaLinear::CublasLt(CublasLtLinearFp8 {
         prefix,
+        quant,
         weight,
         weight_scale,
         bias,
         cublas_lt,
+        out_dtype: vb.dtype(),
     }))
 }
 
@@ -671,13 +726,14 @@ struct Mlp {
     up_proj: LlamaLinear,
     down_proj: LlamaLinear,
     span: tracing::Span,
+    quant: Arc<Fp8Quantize>,
 }
 
 impl Mlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
 
-        let (x_scale, x_fp8) = quantize_fp8_scalar_gpu(x)?;
+        let (x_scale, x_fp8) = self.quant.apply(x)?;
 
         let x = (candle_nn::ops::silu(&self.gate_proj.forward_fp8(&x_fp8, &x_scale)?)?
             * self.up_proj.forward_fp8(&x_fp8, &x_scale)?)?;
@@ -685,19 +741,43 @@ impl Mlp {
         self.down_proj.forward(&x)
     }
 
-    fn load(cublas_lt: CublasLt, vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    fn load(
+        cublas_lt: CublasLt,
+        quant: Arc<Fp8Quantize>,
+        vb: VarBuilder,
+        cfg: &Config,
+    ) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "mlp");
         let h_size = cfg.hidden_size;
         let i_size = cfg.intermediate_size;
-        let gate_proj = cublas_linear(cublas_lt.clone(), h_size, i_size, vb.pp("gate_proj"))?;
-        let up_proj = cublas_linear(cublas_lt.clone(), h_size, i_size, vb.pp("up_proj"))?;
-        let down_proj = cublas_linear(cublas_lt.clone(), i_size, h_size, vb.pp("down_proj"))?;
+        let gate_proj = cublas_linear(
+            cublas_lt.clone(),
+            quant.clone(),
+            h_size,
+            i_size,
+            vb.pp("gate_proj"),
+        )?;
+        let up_proj = cublas_linear(
+            cublas_lt.clone(),
+            quant.clone(),
+            h_size,
+            i_size,
+            vb.pp("up_proj"),
+        )?;
+        let down_proj = cublas_linear(
+            cublas_lt.clone(),
+            quant.clone(),
+            i_size,
+            h_size,
+            vb.pp("down_proj"),
+        )?;
 
         Ok(Self {
             gate_proj,
             up_proj,
             down_proj,
             span,
+            quant,
         })
     }
 }

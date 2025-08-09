@@ -137,6 +137,14 @@ fn main() -> Result<()> {
     };
 
     let device = candle_examples::device(args.cpu)?;
+    #[cfg(feature = "cuda")]
+    if let candle::Device::Cuda(d) = &device {
+        unsafe {
+            println!("disabling event tracking");
+            d.disable_event_tracking();
+        }
+    }
+
     let dtype = match args.dtype.as_deref() {
         Some("f16") => DType::F16,
         Some("bf16") => DType::BF16,
