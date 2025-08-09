@@ -30,10 +30,12 @@ impl VarMap {
 
     /// Save the map in the safetensors format.
     pub fn save<P: AsRef<std::path::Path>>(&self, path: P) -> Result<()> {
-        let tensor_data = self.data.lock().unwrap();
-        let data = tensor_data.iter().map(|(k, v)| (k, v.as_tensor()));
-        safetensors::tensor::serialize_to_file(data, &None, path.as_ref())?;
-        Ok(())
+        // let tensor_data = self.data.lock().unwrap();
+        // let data = tensor_data.iter().map(|(k, v)| (k, v.as_tensor()));
+        // safetensors::tensor::serialize_to_file(data, &None, path.as_ref())?;
+        // Ok(())
+
+        todo!()
     }
 
     /// Load some values from a safetensors file and modify the existing variables to have these
