@@ -24,7 +24,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_plain = { workspace = true }
 tracing = { workspace = true }
-candle-cublaslt = { path = "../../candle-extensions/candle-cublaslt" }
+candle-cublaslt = { git = "https://github.com/mixlayer/candle-extensions.git", branch = "cublaslt_fp8" }
 cudarc = { workspace = true }
 float8 = { workspace = true }
 
